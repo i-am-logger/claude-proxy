@@ -55,10 +55,30 @@ jobs:
     if: |
       github.event_name == 'push' &&
       github.ref == 'refs/heads/master' &&
-      needs.devenv-checks.result == 'success'
+      (needs.devenv-checks.result == 'success' || needs.devenv-checks.result == 'skipped')
     needs: [devenv-checks]
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          release-type: rust
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [release-please]
+    if: needs.release-please.outputs.release_created == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

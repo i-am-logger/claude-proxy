@@ -1,18 +1,42 @@
 [package]
-name = "my-project"
+name = "claude-proxy"
 version = "0.1.0"
 edition = "2024"
 authors = ["i-am-logger"]
-description = "A Rust CLI project"
+description = "OpenAI-compatible API proxy for Claude Code CLI"
 license = "CC-BY-NC-SA-4.0"
+repository = "https://github.com/i-am-logger/claude-proxy"
+keywords = ["claude", "openai", "proxy", "llm", "api"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [dependencies]
-# CLI
-clap = { version = "4.5", features = ["derive"] }
+# HTTP server
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Logging
-log = "0.4"
-env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 thiserror = "2.0"
+
+# Streaming
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["io-util"] }
+
+# Security
+subtle = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+proptest = "1"
+http-body-util = "0.1"
