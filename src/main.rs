@@ -413,6 +413,43 @@ async fn call_claude_streaming(
     Ok(child)
 }
 
+// --- Stream parsing ---
+
+/// Extract text content from a Claude stream-json line.
+/// Returns Some(text) for lines containing assistant text or result text,
+/// None for lines that should be skipped (system, rate_limit, empty, etc.)
+/// Returns (text, is_from_assistant) — callers use is_from_assistant to avoid
+/// emitting the result fallback when assistant content was already sent.
+fn extract_stream_text(line: &str) -> Option<(String, bool)> {
+    if line.is_empty() {
+        return None;
+    }
+    let msg: Value = serde_json::from_str(line).ok()?;
+    let msg_type = msg.get("type").and_then(|t| t.as_str())?;
+
+    if msg_type == "assistant"
+        && let Some(blocks) = msg.pointer("/message/content").and_then(|c| c.as_array())
+    {
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !texts.is_empty() {
+            return Some((texts.join(""), true));
+        }
+    }
+
+    if msg_type == "result"
+        && let Some(result) = msg.get("result").and_then(|r| r.as_str())
+        && !result.is_empty()
+    {
+        return Some((result.to_string(), false));
+    }
+
+    None
+}
+
 // --- Handlers ---
 
 async fn health() -> &'static str {
@@ -479,6 +516,7 @@ async fn chat_completions(
                 )
             })?;
 
+        // Take stdout BEFORE creating the stream — child stays alive via _child binding
         let stdout = child.stdout.take().ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -490,6 +528,8 @@ async fn chat_completions(
                 }),
             )
         })?;
+        let _child = child; // keep child alive for the stream's lifetime
+
         let reader = BufReader::new(stdout);
         let lines = LinesStream::new(reader.lines());
         let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -500,54 +540,31 @@ async fn chat_completions(
 
         let stream = async_stream::stream! {
             use tokio_stream::StreamExt;
+            // _child is captured by reference, keeping the process alive
+            let _ = &_child;
             let mut lines = lines;
             let mut sent_role = false;
 
             while let Some(Ok(line)) = lines.next().await {
                 let line: String = line;
-                if line.is_empty() { continue; }
-
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                if msg_type == "assistant"
-                    && let Some(content) = msg.pointer("/message/content")
-                    && let Some(blocks) = content.as_array()
-                {
-                    for block in blocks {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str())
-                            && !text.is_empty()
-                        {
-                            if !sent_role {
-                                let chunk = serde_json::json!({
-                                    "id": &chat_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": &model,
-                                    "choices": [{"index": 0, "delta": {"role": "assistant"}}]
-                                });
-                                yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
-                                sent_role = true;
-                            }
-                            let chunk = serde_json::json!({
-                                "id": &chat_id, "object": "chat.completion.chunk",
-                                "created": created, "model": &model,
-                                "choices": [{"index": 0, "delta": {"content": text}}]
-                            });
-                            yield Ok(Event::default().data(chunk.to_string()));
-                        }
+                if let Some((text, is_assistant)) = extract_stream_text(&line) {
+                    // Skip result fallback if assistant content was already sent
+                    if !is_assistant && sent_role { continue; }
+                    if !sent_role {
+                        let chunk = serde_json::json!({
+                            "id": &chat_id, "object": "chat.completion.chunk",
+                            "created": created, "model": &model,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}}]
+                        });
+                        yield Ok::<_, Infallible>(Event::default().data(chunk.to_string()));
+                        sent_role = true;
                     }
-                }
-
-                if msg_type == "result"
-                    && let Some(result) = msg.get("result").and_then(|r| r.as_str())
-                    && !result.is_empty() && !sent_role
-                {
                     let chunk = serde_json::json!({
                         "id": &chat_id, "object": "chat.completion.chunk",
                         "created": created, "model": &model,
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": result}}]
+                        "choices": [{"index": 0, "delta": {"content": text}}]
                     });
                     yield Ok(Event::default().data(chunk.to_string()));
-                    sent_role = true;
                 }
             }
 
@@ -640,6 +657,7 @@ async fn responses(
             .stdout
             .take()
             .ok_or_else(|| make_error("Failed to capture claude stdout".into()))?;
+        let _child = child;
 
         let reader = BufReader::new(stdout);
         let lines = LinesStream::new(reader.lines());
@@ -648,6 +666,7 @@ async fn responses(
 
         let stream = async_stream::stream! {
             use tokio_stream::StreamExt;
+            let _ = &_child;
             let mut lines = lines;
 
             // response.created
@@ -665,35 +684,15 @@ async fn responses(
                 .event("response.content_part.added")
                 .data(serde_json::json!({"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}).to_string()));
 
+            let mut sent_content = false;
             while let Some(Ok(line)) = lines.next().await {
                 let line: String = line;
-                if line.is_empty() { continue; }
-
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                if msg_type == "assistant"
-                    && let Some(content) = msg.pointer("/message/content")
-                    && let Some(blocks) = content.as_array()
-                {
-                    for block in blocks {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str())
-                            && !text.is_empty()
-                        {
-                            yield Ok(Event::default()
-                                .event("response.output_text.delta")
-                                .data(serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":text}).to_string()));
-                        }
-                    }
-                }
-
-                if msg_type == "result"
-                    && let Some(result) = msg.get("result").and_then(|r| r.as_str())
-                    && !result.is_empty()
-                {
+                if let Some((text, is_assistant)) = extract_stream_text(&line) {
+                    if !is_assistant && sent_content { continue; }
+                    sent_content = true;
                     yield Ok(Event::default()
                         .event("response.output_text.delta")
-                        .data(serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":result}).to_string()));
+                        .data(serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":text}).to_string()));
                 }
             }
 
@@ -1239,5 +1238,90 @@ mod tests {
     async fn responses_without_v1_rejects_no_auth() {
         let resp = send_request(test_app(), "POST", "/responses", r#"{"input":"hi"}"#, false).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ========== extract_stream_text (Claude stream-json parsing) ==========
+
+    #[test]
+    fn stream_extracts_assistant_text() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"Hi! How can I help you today?"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":1}},"session_id":"abc"}"#;
+        let result = extract_stream_text(line);
+        assert_eq!(result, Some(("Hi! How can I help you today?".into(), true)));
+    }
+
+    #[test]
+    fn stream_extracts_result_text() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1877,"result":"Hi! How can I help you today?","stop_reason":"end_turn","session_id":"abc"}"#;
+        let result = extract_stream_text(line);
+        assert_eq!(
+            result,
+            Some(("Hi! How can I help you today?".into(), false))
+        );
+    }
+
+    #[test]
+    fn stream_skips_system_init() {
+        let line = r#"{"type":"system","subtype":"init","cwd":"/home/user","session_id":"abc","tools":["Bash"]}"#;
+        assert_eq!(extract_stream_text(line), None);
+    }
+
+    #[test]
+    fn stream_skips_rate_limit() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"abc"}"#;
+        assert_eq!(extract_stream_text(line), None);
+    }
+
+    #[test]
+    fn stream_skips_empty_line() {
+        assert_eq!(extract_stream_text(""), None);
+    }
+
+    #[test]
+    fn stream_skips_invalid_json() {
+        assert_eq!(extract_stream_text("not json"), None);
+    }
+
+    #[test]
+    fn stream_extracts_multiblock_content() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"world!"}]}}"#;
+        let result = extract_stream_text(line);
+        assert_eq!(result, Some(("Hello world!".into(), true)));
+    }
+
+    #[test]
+    fn stream_skips_empty_result() {
+        let line = r#"{"type":"result","result":"","session_id":"abc"}"#;
+        assert_eq!(extract_stream_text(line), None);
+    }
+
+    #[test]
+    fn stream_skips_assistant_without_content() {
+        let line = r#"{"type":"assistant","message":{}}"#;
+        assert_eq!(extract_stream_text(line), None);
+    }
+
+    #[test]
+    fn stream_real_claude_output() {
+        // Real output from: claude --print --model opus --output-format stream-json --verbose "say hi"
+        let lines = vec![
+            r#"{"type":"system","subtype":"init","cwd":"/home/user","session_id":"dfe46515","tools":["Bash"],"model":"claude-opus-4-6","permissionMode":"default"}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_017yp","type":"message","role":"assistant","content":[{"type":"text","text":"Hi! How can I help you today?"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":1}},"session_id":"dfe46515"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1773878400},"session_id":"dfe46515"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1877,"result":"Hi! How can I help you today?","stop_reason":"end_turn","session_id":"dfe46515"}"#,
+        ];
+
+        let results: Vec<(String, bool)> = lines
+            .iter()
+            .filter_map(|l| extract_stream_text(l))
+            .collect();
+        // assistant (true) + result fallback (false)
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1, true, "first should be from assistant");
+        assert_eq!(results[1].1, false, "second should be from result");
+        assert!(
+            results[0].0.contains("Hi!"),
+            "First text should contain 'Hi!', got: {}",
+            results[0].0
+        );
     }
 }
