@@ -1,9 +1,10 @@
-# claude-proxy [ARCHIVED]
+# claude-proxy
 
-> **WARNING: Using this tool violates [Anthropic's Consumer Terms of Service](https://www.anthropic.com/legal/consumer-terms) as of February 19, 2026.** Anthropic explicitly prohibits using OAuth tokens from Claude Free, Pro, or Max subscriptions in any third-party tool or service. This includes proxying the Claude Code CLI. See [Anthropic's announcement](https://www.theregister.com/2026/02/20/anthropic_clarifies_ban_third_party_claude_access/) for details. This repository is archived for reference only.
-
+[![CI](https://github.com/i-am-logger/claude-proxy/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/i-am-logger/claude-proxy/actions/workflows/ci.yml)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+
+> **Note on Anthropic ToS:** On Feb 19, 2026, Anthropic [updated their Consumer ToS](https://privacy.claude.com/en/articles/9264813-consumer-terms-of-service-updates) to ban extracting OAuth tokens for use in third-party tools. This proxy does **not** extract or forward tokens — it spawns `claude --print` as a subprocess, which is an [officially supported](https://code.claude.com/docs/en/legal-and-compliance) programmatic use pattern (same as scripting, piping, or cron jobs). The CLI manages its own authentication internally. This tool is intended for personal, single-user, localhost automation only.
 
 > OpenAI-compatible API proxy for [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code). Uses your authenticated Claude Code (Max subscription) for inference — no API keys needed.
 
