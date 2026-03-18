@@ -8,14 +8,32 @@ use axum::{
     },
     routing::{get, post},
 };
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{convert::Infallible, env, process::Stdio, sync::Arc};
+use std::{convert::Infallible, process::Stdio, sync::Arc};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio_stream::wrappers::LinesStream;
 use tracing::info;
+
+/// OpenAI-compatible API proxy for Claude Code CLI
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Bearer token for proxy authentication
+    #[arg(long, env = "PROXY_API_KEY")]
+    api_key: String,
+
+    /// Listen port
+    #[arg(short, long, env = "PORT", default_value = "8080")]
+    port: u16,
+
+    /// Default Claude model (haiku/sonnet/opus)
+    #[arg(short, long, env = "CLAUDE_MODEL", default_value = "sonnet")]
+    model: String,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -741,13 +759,10 @@ async fn main() {
         )
         .init();
 
-    let api_key = env::var("PROXY_API_KEY").expect("PROXY_API_KEY required");
-    let default_model =
-        normalize_model(&env::var("CLAUDE_MODEL").unwrap_or_else(|_| "sonnet".into()));
-    let port: u16 = env::var("PORT")
-        .unwrap_or_else(|_| "8080".into())
-        .parse()
-        .expect("PORT must be a number");
+    let cli = Cli::parse();
+    let api_key = cli.api_key;
+    let default_model = normalize_model(&cli.model);
+    let port = cli.port;
 
     let state = Arc::new(AppState {
         api_key,

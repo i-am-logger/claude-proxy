@@ -10,6 +10,9 @@ keywords = ["claude", "openai", "proxy", "llm", "api"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 
 [dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
 # HTTP server
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
