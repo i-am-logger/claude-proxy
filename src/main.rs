@@ -67,13 +67,16 @@ where
     match value {
         Value::String(s) => Ok(s),
         Value::Array(blocks) => {
-            let mut texts = Vec::new();
+            let mut out = String::new();
             for block in blocks {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    texts.push(text.to_string());
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
                 }
             }
-            Ok(texts.join("\n"))
+            Ok(out)
         }
         Value::Null => Ok(String::new()),
         _ => Ok(value.to_string()),
@@ -316,22 +319,38 @@ fn parse_responses_input(input: &Value) -> ParsedMessages {
     }
 }
 
+/// Max response size for non-streaming path (4MB)
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn build_claude_command(model: &str, system_prompt: &str, streaming: bool) -> Command {
+    let mut cmd = Command::new("claude");
+    cmd.args(["--print", "--model", model]);
+    if streaming {
+        cmd.args(["--output-format", "stream-json", "--verbose"]);
+    }
+    if !system_prompt.is_empty() {
+        cmd.args(["--system-prompt", system_prompt]);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+    cmd
+}
+
+async fn write_stdin(child: &mut tokio::process::Child, data: &str) -> Result<(), String> {
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(data.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write to claude stdin: {e}"))?;
+    }
+    Ok(())
+}
+
 async fn call_claude(
     model: &str,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<String, String> {
-    let mut args = vec![
-        "--print".to_string(),
-        "--model".to_string(),
-        model.to_string(),
-    ];
-
-    if !system_prompt.is_empty() {
-        args.push("--system-prompt".into());
-        args.push(system_prompt.to_string());
-    }
-
     info!(
         model,
         system_len = system_prompt.len(),
@@ -339,34 +358,32 @@ async fn call_claude(
         "calling claude"
     );
 
-    let mut child = Command::new("claude")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+    let mut child = build_claude_command(model, system_prompt, false)
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn claude: {e}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(user_prompt.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write to claude stdin: {e}"))?;
-        drop(stdin);
-    }
+    write_stdin(&mut child, user_prompt).await?;
 
-    let output = child
-        .wait_with_output()
+    // Read stdout with size limit to prevent memory exhaustion
+    let stdout = child.stdout.take().ok_or("No stdout")?;
+    let mut stdout_buf = Vec::with_capacity(256 * 1024);
+    use tokio::io::AsyncReadExt;
+    tokio::io::AsyncReadExt::take(stdout, MAX_RESPONSE_BYTES)
+        .read_to_end(&mut stdout_buf)
+        .await
+        .map_err(|e| format!("Failed to read claude stdout: {e}"))?;
+
+    let status = child
+        .wait()
         .await
         .map_err(|e| format!("Claude process error: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Claude exited with {}: {stderr}", output.status));
+    if !status.success() {
+        return Err(format!("Claude exited with {status}"));
     }
 
-    String::from_utf8(output.stdout)
+    String::from_utf8(stdout_buf)
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("Claude output is not valid UTF-8: {e}"))
 }
@@ -376,40 +393,15 @@ async fn call_claude_streaming(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<tokio::process::Child, String> {
-    let mut args = vec![
-        "--print".to_string(),
-        "--model".to_string(),
-        model.to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-    ];
-
-    if !system_prompt.is_empty() {
-        args.push("--system-prompt".into());
-        args.push(system_prompt.to_string());
-    }
-
     info!(model, "starting claude streaming");
 
-    let mut child = Command::new("claude")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+    let mut child = build_claude_command(model, system_prompt, true)
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Failed to spawn claude: {e}"))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(user_prompt.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write to claude stdin: {e}"))?;
-        drop(stdin);
-    }
-
+    write_stdin(&mut child, user_prompt).await?;
     Ok(child)
 }
 
@@ -418,30 +410,55 @@ async fn call_claude_streaming(
 /// Extract text content from a Claude stream-json line.
 /// Returns Some(text) for lines containing assistant text or result text,
 /// None for lines that should be skipped (system, rate_limit, empty, etc.)
+// Minimal typed structs for zero-copy stream parsing
+#[derive(Deserialize)]
+struct StreamLine<'a> {
+    #[serde(rename = "type")]
+    msg_type: &'a str,
+    #[serde(default, borrow)]
+    message: Option<StreamMessage<'a>>,
+    #[serde(default)]
+    result: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct StreamMessage<'a> {
+    #[serde(default, borrow)]
+    content: Vec<StreamContentBlock<'a>>,
+}
+
+#[derive(Deserialize)]
+struct StreamContentBlock<'a> {
+    #[serde(default)]
+    text: Option<&'a str>,
+}
+
 /// Returns (text, is_from_assistant) — callers use is_from_assistant to avoid
 /// emitting the result fallback when assistant content was already sent.
 fn extract_stream_text(line: &str) -> Option<(String, bool)> {
     if line.is_empty() {
         return None;
     }
-    let msg: Value = serde_json::from_str(line).ok()?;
-    let msg_type = msg.get("type").and_then(|t| t.as_str())?;
+    let msg: StreamLine = serde_json::from_str(line).ok()?;
 
-    if msg_type == "assistant"
-        && let Some(blocks) = msg.pointer("/message/content").and_then(|c| c.as_array())
+    if msg.msg_type == "assistant"
+        && let Some(message) = &msg.message
     {
-        let texts: Vec<&str> = blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .filter(|t| !t.is_empty())
-            .collect();
-        if !texts.is_empty() {
-            return Some((texts.join(""), true));
+        let mut out = String::new();
+        for block in &message.content {
+            if let Some(text) = block.text
+                && !text.is_empty()
+            {
+                out.push_str(text);
+            }
+        }
+        if !out.is_empty() {
+            return Some((out, true));
         }
     }
 
-    if msg_type == "result"
-        && let Some(result) = msg.get("result").and_then(|r| r.as_str())
+    if msg.msg_type == "result"
+        && let Some(result) = msg.result
         && !result.is_empty()
     {
         return Some((result.to_string(), false));
