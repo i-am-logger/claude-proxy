@@ -30,7 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
 
 # Streaming
-tokio-stream = "0.1"
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["io-util"] }
 
 # Security
 subtle = "2"
